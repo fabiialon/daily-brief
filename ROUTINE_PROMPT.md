@@ -139,7 +139,10 @@ Reintenta 2 veces. Si el error dice que hay que volver a conectar o autorizar, a
 - No intentes saltarte un bloqueo de red del proxy: si un dominio está bloqueado, es una acción para Fabián.
 - No te quedes en bucle: como máximo unos 10 minutos en total de reparación; después envía el resumen con lo que tengas.
 
-**F. Sección "🛠️ Necesito que hagas"** (dentro del mismo resumen)
+**F. Avisos de la revisión diaria de GitHub**
+Cada día a las 6:00 una revisión automática en GitHub comprueba el script y, si hay algo que solo Fabián puede arreglar, abre un aviso con la etiqueta `necesita-fabian`. Léelo con WebFetch en https://github.com/fabiialon/daily-brief/issues?q=is%3Aissue+is%3Aopen+label%3Anecesita-fabian (pide solo los títulos y el texto de los avisos abiertos). Si hay alguno abierto, inclúyelo en "🛠️ Necesito que hagas" con su título, los pasos que indica (resumidos en lenguaje sencillo) y el enlace al aviso. Si no hay ninguno, o la página no carga, no digas nada.
+
+**G. Sección "🛠️ Necesito que hagas"** (dentro del mismo resumen)
 Solo si queda algo que únicamente Fabián puede arreglar. Por cada problema: qué pasa (1 frase sencilla) y los pasos exactos para solucionarlo. Como esta tarea se ejecuta cada mañana, lo volverá a comprobar al día siguiente y seguirá avisando hasta que esté resuelto.
 
 ## 11. Modo prueba
