@@ -102,7 +102,7 @@ def test_missing_env_var(monkeypatch):
         "http500",
     ],
 )
-def test_feed_down_retries_once_and_hides_url(monkeypatch, failure):
+def test_feed_down_retries_with_backoff_and_hides_url(monkeypatch, failure, sleeps):
     calls = []
 
     def fake_get(url, timeout=None, **kw):
@@ -115,6 +115,7 @@ def test_feed_down_retries_once_and_hides_url(monkeypatch, failure):
     monkeypatch.setattr(requests, "get", fake_get)
     with pytest.raises(blackboard.SourceError) as info:
         blackboard.get_events(date(2026, 11, 24))
-    assert len(calls) == 2 and calls[0] == 20
+    assert len(calls) == 4 and calls[0] == 20
+    assert sleeps == [2, 4, 8]
     assert "FAKEID123SECRET" not in str(info.value) and "example.invalid/" not in str(info.value)
     assert info.value.__cause__ is None and info.value.__suppress_context__

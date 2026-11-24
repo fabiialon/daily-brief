@@ -22,6 +22,7 @@ pip install -r requirements-dev.txt    # para los tests
 export BLACKBOARD_ICS_URL='...'        # URL de tu feed iCal (secreta)
 python -m brief                        # hoy (fecha de Europe/Madrid)
 python -m brief --date 2026-11-24
+python -m brief --doctor               # autodiagnóstico de cada fuente
 pytest -q                              # sin conexión a internet
 ```
 
@@ -29,12 +30,32 @@ pytest -q                              # sin conexión a internet
 
 ## Clima: proveedores y `clima_fuente`
 
-1. **Open-Meteo**. Si responde 429 (límite de peticiones) o 5xx, el script reintenta hasta 3 veces, esperando 2, 4 y 8 s.
+1. **Open-Meteo**. Si hay un error de red o responde 429 (límite de peticiones) o 5xx, el script reintenta hasta 3 veces, esperando 2, 4 y 8 s. Blackboard y met.no se reintentan igual.
 2. **met.no** (`locationforecast 2.0`, Instituto Meteorológico de Noruega) se usa si Open-Meteo sigue fallando por cualquier motivo. Sus horas vienen en UTC y se pasan a hora de Madrid. Como met.no casi nunca da la probabilidad de lluvia fuera de los países nórdicos, el script la estima: una hora con más de 0,1 mm de lluvia prevista cuenta como lluvia.
 
 Las dos peticiones llevan el User-Agent `daily-brief/1.0 github.com/fabiialon/daily-brief`, que met.no exige.
 
 El campo de primer nivel `clima_fuente` indica de dónde salió el clima: `"open-meteo"`, `"met.no"` o `null` si fallaron los dos. En ese último caso el error de ambos queda en `errores`.
+
+## Autorreparación
+
+Cada día a las 05:00 UTC (6:00 o 7:00 en Madrid, antes del resumen de las 7:55) se ejecuta el workflow `.github/workflows/health.yml`. También se puede lanzar a mano con `gh workflow run health.yml`. El workflow pasa `pytest` y `python -m brief --doctor`, que comprueba Blackboard, Open-Meteo y met.no por separado y da a cada fuente el estado `ok`, `reparado` o `fallo`, con la causa.
+
+**Se arregla solo, sin que hagas nada:**
+- Errores de red, 429 y 5xx: se reintentan con espera exponencial.
+- Si `icalendar` no está instalado o falla, el calendario se lee con un parser de reserva escrito solo con la librería estándar. Blackboard sale como `reparado`.
+- Si Open-Meteo falla, se usa met.no. Si fallan los dos, el clima sale `null` con la causa de cada uno.
+- Si falla el código (tests rojos o un cambio de formato en una fuente, `formato_cambiado`), un segundo job lanza Claude Code (`anthropics/claude-code-action`). Claude diagnostica, corrige y ejecuta pytest y el doctor, con un máximo de 5 ciclos. Después el workflow vuelve a verificarlo y, si pytest y el doctor pasan, abre un PR y lo mergea a `main`. Claude solo puede editar archivos y ejecutar pytest y el doctor; no puede hacer commits ni leer el secreto del feed.
+
+**Necesita tu intervención:**
+- `enlace_caducado`: Blackboard responde 401/403/404 o una página de login. Hay que generar un enlace iCal nuevo, actualizar el secreto y la tarea programada.
+- `dominio_bloqueado`: no se puede conectar con el servidor (proxy o conexión rechazada).
+- `falta_configuracion`: falta el secreto `BLACKBOARD_ICS_URL`.
+- Que Claude no consiga arreglar el código en 5 ciclos. Al día siguiente lo vuelve a intentar.
+
+En esos casos se abre una única issue con la etiqueta `necesita-fabian` y los pasos exactos. Mientras siga el problema, cada día se añade un comentario a esa misma issue, y se cierra sola con el comentario "Resuelto" el primer día que todo sale bien.
+
+Para ver las issues abiertas: `gh issue list --label necesita-fabian`, o la pestaña *Issues* del repo filtrada por esa etiqueta. Si un servicio está caído o limita las peticiones y no hay alternativa, el workflow sale en rojo pero no abre issue, porque no es algo que tú puedas arreglar.
 
 ## Variables de entorno
 

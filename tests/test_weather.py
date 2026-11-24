@@ -124,11 +124,12 @@ def test_both_providers_down(monkeypatch, sleeps):
     scripted_get(
         monkeypatch,
         [FakeResponse(status=503, url="https://api.open-meteo.com/v1/forecast?x=1")] * 4
-        + [requests.ConnectionError("Max retries exceeded with url: https://api.met.no/weatherapi/x")],
+        + [requests.ConnectionError("Max retries exceeded with url: https://api.met.no/weatherapi/x")] * 4,
     )
     with pytest.raises(RuntimeError) as info:
         weather.get_weather(DAY)
-    assert "open-meteo" in str(info.value) and "met.no" in str(info.value)
+    # a clear cause for each provider
+    assert "open-meteo (servicio_caido)" in str(info.value) and "met.no (dominio_bloqueado)" in str(info.value)
     assert info.value.__cause__ is None and info.value.__suppress_context__
 
 

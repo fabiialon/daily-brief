@@ -1,10 +1,9 @@
 """Madrid daily forecast from Open-Meteo (no API key)."""
-import time
 from collections import Counter
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-import requests
+from brief import net
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
 PARAMS = {
@@ -16,8 +15,6 @@ PARAMS = {
 }
 METNO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
 METNO_PARAMS = {"lat": 40.4168, "lon": -3.7038}
-HEADERS = {"User-Agent": "daily-brief/1.0 github.com/fabiialon/daily-brief"}  # met.no requires one
-RETRY_WAITS = (2, 4, 8)
 MADRID = ZoneInfo("Europe/Madrid")
 RAIN_HOUR_MIN = 40
 UMBRELLA_MIN = 50
@@ -113,7 +110,7 @@ def summarize(data, day: date):
     iso = day.isoformat()
     daily, hourly = data["daily"], data["hourly"]
     if daily.get("time") != [iso] or not all(t.startswith(iso) for t in hourly.get("time", [])):
-        raise ValueError(f"Open-Meteo devolvió datos de otra fecha (pedida {iso}, recibida {daily.get('time')})")
+        raise StaleForecast(f"Open-Meteo devolvió datos de otra fecha (pedida {iso}, recibida {daily.get('time')})")
     probs = {int(t[11:13]): p for t, p in zip(hourly["time"], hourly["precipitation_probability"]) if p is not None}
     return build(
         daily["temperature_2m_max"][0],
@@ -150,7 +147,7 @@ def summarize_metno(data, day: date):
         if when.hour in DAY_HOURS and "symbol_code" in nxt.get("summary", {}):
             symbols.append(nxt["summary"]["symbol_code"])
     if not temps:
-        raise ValueError(f"met.no no tiene datos para {day.isoformat()}")
+        raise StaleForecast(f"met.no no tiene datos para {day.isoformat()}")
     if not probs:
         # met.no usually gives no rain probability outside the Nordics: estimate it from the
         # forecast amount, an hour with > 0.1 mm counts as rain (100 %), otherwise 0 %.
@@ -160,26 +157,33 @@ def summarize_metno(data, day: date):
     return build(max(temps), min(temps), max(probs.values(), default=0), probs, code)
 
 
-def get_json(url, params):
-    """GET with retries on 429/5xx (waits 2, 4, 8 s) and our own User-Agent."""
-    for wait in RETRY_WAITS + (None,):
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
-        if wait is not None and (resp.status_code == 429 or resp.status_code >= 500):
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp.json()
+class StaleForecast(ValueError):
+    """The provider answered, but not for the requested day (never return another day's data)."""
+
+
+def fetch_open_meteo(day: date):
+    params = dict(PARAMS, start_date=day.isoformat(), end_date=day.isoformat())
+    return summarize(net.get(API_URL, params).json(), day)
+
+
+def fetch_metno(day: date):
+    return summarize_metno(net.get(METNO_URL, METNO_PARAMS).json(), day)
+
+
+PROVIDERS = (("open-meteo", fetch_open_meteo), ("met.no", fetch_metno))
+
+
+def failure_cause(exc):
+    """Doctor cause for a weather failure; 4xx other than 429 means the API changed."""
+    return "servicio_caido" if isinstance(exc, StaleForecast) else net.cause(exc, client_error="formato_cambiado")
 
 
 def get_weather(day: date):
-    """Returns (weather, source). Falls back to met.no if Open-Meteo fails for any reason."""
-    try:
-        params = dict(PARAMS, start_date=day.isoformat(), end_date=day.isoformat())
-        return summarize(get_json(API_URL, params), day), "open-meteo"
-    except Exception as first:
+    """Returns (weather, source): Open-Meteo, then met.no if it fails for any reason."""
+    errors = []
+    for name, fetch in PROVIDERS:
         try:
-            return summarize_metno(get_json(METNO_URL, METNO_PARAMS), day), "met.no"
-        except Exception as second:
-            raise RuntimeError(
-                f"open-meteo: {type(first).__name__}: {first} | met.no: {type(second).__name__}: {second}"
-            ) from None
+            return fetch(day), name
+        except Exception as exc:
+            errors.append(f"{name} ({failure_cause(exc)}): {type(exc).__name__}: {exc}")
+    raise RuntimeError(" | ".join(errors)) from None
