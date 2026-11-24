@@ -1,2 +1,6 @@
 requests==2.32.*
 icalendar==6.*
+# Pinned so `import requests` raises no RequestsDependencyWarning, even over preinstalled system packages.
+urllib3==2.*
+charset-normalizer==3.*
+chardet==5.*

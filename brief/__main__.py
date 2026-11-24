@@ -14,11 +14,15 @@ def build(day: date):
         "manana": (day + timedelta(days=1)).isoformat(),
         "blackboard": None,
         "clima": None,
+        "clima_fuente": None,
         "errores": [],
     }
     for key, fetch in (("blackboard", blackboard.get_events), ("clima", weather.get_weather)):
         try:
-            out[key] = fetch(day)
+            if key == "clima":
+                out["clima"], out["clima_fuente"] = fetch(day)
+            else:
+                out[key] = fetch(day)
         except Exception as exc:  # one source failing must not break the brief
             msg = f"{type(exc).__name__}: {exc}" if not isinstance(exc, blackboard.SourceError) else str(exc)
             out["errores"].append({"fuente": key, "mensaje": blackboard.sanitize(msg, os.environ.get(blackboard.ENV_VAR))})
