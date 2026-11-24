@@ -1,0 +1,216 @@
+name: health
+
+# Daily self-check before the 7:55 (Madrid) brief. 05:00 UTC is 6:00 in winter and 7:00 in summer.
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      forzar_reparacion:
+        description: "Lanzar también el job de reparación con Claude (para probar la configuración)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: health
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      needs_code: ${{ steps.decide.outputs.needs_code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -q -r requirements-dev.txt
+
+      - name: Tests
+        id: tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee "$RUNNER_TEMP/pytest.txt"
+
+      - name: Doctor
+        env:
+          BLACKBOARD_ICS_URL: ${{ secrets.BLACKBOARD_ICS_URL }}
+        run: |
+          python -m brief --doctor > "$RUNNER_TEMP/doctor.json" || true
+          cat "$RUNNER_TEMP/doctor.json"
+
+      - name: Decide
+        id: decide
+        env:
+          TESTS: ${{ steps.tests.outcome }}
+        run: python -m brief.health "$RUNNER_TEMP/doctor.json" "$TESTS" "$RUNNER_TEMP/issue.md"
+
+      - name: Keep the report for the repair job
+        if: steps.decide.outputs.needs_code == 'true' || inputs.forzar_reparacion
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-report
+          path: |
+            ${{ runner.temp }}/pytest.txt
+            ${{ runner.temp }}/doctor.json
+          retention-days: 3
+
+      - name: Close the necesita-fabian issue
+        if: steps.decide.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/scripts/issue.sh close
+
+      - name: Open or update the necesita-fabian issue
+        if: steps.decide.outputs.needs_user == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ steps.decide.outputs.issue_title }}
+        run: bash .github/scripts/issue.sh upsert "$TITLE" "$RUNNER_TEMP/issue.md"
+
+      - name: Result
+        if: steps.decide.outputs.ok != 'true'
+        run: |
+          echo "::error::Hay tests rojos o fuentes con fallo: mira los pasos Tests y Doctor."
+          exit 1
+
+  repair:
+    needs: check
+    if: always() && (needs.check.outputs.needs_code == 'true' || inputs.forzar_reparacion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      # Only the doctor uses it. Claude's shell is limited to pytest and the doctor (claude_args below),
+      # and GitHub masks the secret if it ever reaches a log.
+      BLACKBOARD_ICS_URL: ${{ secrets.BLACKBOARD_ICS_URL }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -q -r requirements-dev.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: health-report
+          path: ${{ runner.temp }}/report
+
+      - name: Build prompt
+        id: prompt
+        run: |
+          delim="PROMPT_$(openssl rand -hex 8)"
+          {
+            echo "text<<$delim"
+            cat .github/repair-prompt.md
+            echo
+            echo "## Salida de pytest (últimas 60 líneas)"
+            echo '```'
+            tail -n 60 "$RUNNER_TEMP/report/pytest.txt" 2>/dev/null || echo "(sin salida)"
+            echo '```'
+            echo
+            echo "## Informe del doctor"
+            echo '```json'
+            cat "$RUNNER_TEMP/report/doctor.json" 2>/dev/null || echo "(el doctor no produjo un JSON)"
+            echo '```'
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude repair (max 5 cycles)
+        id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: |
+            --max-turns 80
+            --permission-mode default
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(python -m pytest:*),Bash(python -m brief --doctor)"
+            --disallowedTools "Read(//proc/**),Bash(env:*),Bash(printenv:*),Bash(git push:*),WebFetch,WebSearch"
+
+      - name: Verify (pytest + doctor)
+        id: verify
+        run: |
+          set +e
+          python -m pytest -q > "$RUNNER_TEMP/verify-pytest.txt" 2>&1
+          rc=$?
+          tests=$([ "$rc" -eq 0 ] && echo success || echo failure)
+          tail -n 30 "$RUNNER_TEMP/verify-pytest.txt"
+          python -m brief --doctor > "$RUNNER_TEMP/verify-doctor.json" 2>/dev/null
+          cat "$RUNNER_TEMP/verify-doctor.json"
+          python -m brief.health "$RUNNER_TEMP/verify-doctor.json" "$tests" "$RUNNER_TEMP/verify-issue.md"
+
+      - name: Pull request and merge
+        id: pr
+        if: steps.verify.outputs.needs_code == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          if [ -f REPAIR_NOTES.md ]; then mv REPAIR_NOTES.md "$notes"; else echo "Claude no dejó notas." > "$notes"; fi
+          git add -A
+          if git diff --cached --quiet "$BASE_SHA"; then
+            echo "::notice::Sin cambios de código: no hay nada que publicar."
+            exit 0
+          fi
+          branch="autofix/$(date -u +%Y%m%d)-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -q -c "$branch"
+          git commit -q -m "Autorreparación: corrige el fallo detectado por la vigilancia diaria"
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+          url=$(gh pr create --base main --head "$branch" --title "Autorreparación $(date -u +%F)" --body-file "$notes")
+          gh pr merge "$url" --merge --delete-branch
+
+      - name: Issue if it could not be fixed
+        if: always() && (steps.verify.outputs.needs_code != 'false' || steps.pr.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="$RUNNER_TEMP/repair-issue.md"
+          {
+            echo "La autorreparación no ha conseguido arreglar el código en esta ejecución ($RUN_URL). Mañana lo volverá a intentar."
+            echo
+            echo "## Lo que ha probado Claude"
+            if [ -f REPAIR_NOTES.md ]; then cat REPAIR_NOTES.md; elif [ -f "$RUNNER_TEMP/notes.md" ]; then cat "$RUNNER_TEMP/notes.md"; else echo "(sin notas)"; fi
+            echo
+            echo "## Última verificación"
+            echo '```'
+            tail -n 20 "$RUNNER_TEMP/verify-pytest.txt" 2>/dev/null
+            cat "$RUNNER_TEMP/verify-doctor.json" 2>/dev/null
+            echo '```'
+          } > "$body"
+          bash .github/scripts/issue.sh upsert "La autorreparación no pudo arreglar el código" "$body"
+          exit 1
