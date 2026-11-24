@@ -1,5 +1,8 @@
 """Madrid daily forecast from Open-Meteo (no API key)."""
-from datetime import date
+import time
+from collections import Counter
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -11,6 +14,11 @@ PARAMS = {
     "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
     "hourly": "precipitation_probability,weather_code",
 }
+METNO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
+METNO_PARAMS = {"lat": 40.4168, "lon": -3.7038}
+HEADERS = {"User-Agent": "daily-brief/1.0 github.com/fabiialon/daily-brief"}  # met.no requires one
+RETRY_WAITS = (2, 4, 8)
+MADRID = ZoneInfo("Europe/Madrid")
 RAIN_HOUR_MIN = 40
 UMBRELLA_MIN = 50
 DAY_HOURS = range(8, 23)  # 8:00 to 22:00 inclusive
@@ -48,6 +56,17 @@ WMO = {
 }
 UNKNOWN = ("🌡️", "tiempo variable")
 
+# met.no symbol_code base (without _day/_night/_polartwilight) -> closest WMO code.
+METNO_TO_WMO = {
+    "clearsky": 0, "fair": 1, "partlycloudy": 2, "cloudy": 3, "fog": 45,
+    "lightrain": 61, "rain": 63, "heavyrain": 65,
+    "lightrainshowers": 80, "rainshowers": 81, "heavyrainshowers": 82,
+    "lightsleet": 66, "sleet": 67, "heavysleet": 67,
+    "lightsleetshowers": 85, "sleetshowers": 85, "heavysleetshowers": 86,
+    "lightsnow": 71, "snow": 73, "heavysnow": 75,
+    "lightsnowshowers": 85, "snowshowers": 85, "heavysnowshowers": 86,
+}
+
 
 def rain_ranges(hours):
     """[13, 14, 15, 16] -> ["13–17 h"]: consecutive hours merged, end is exclusive."""
@@ -65,18 +84,13 @@ def rain_ranges(hours):
     return ranges
 
 
-def summarize(data, day: date):
-    iso = day.isoformat()
-    daily, hourly = data["daily"], data["hourly"]
-    if daily.get("time") != [iso] or not all(t.startswith(iso) for t in hourly.get("time", [])):
-        raise ValueError(f"Open-Meteo devolvió datos de otra fecha (pedida {iso}, recibida {daily.get('time')})")
-
-    probs = {int(t[11:13]): p for t, p in zip(hourly["time"], hourly["precipitation_probability"]) if p is not None}
+def build(tmax, tmin, prob_max, probs, code):
+    """Common output for any provider. `probs` maps Madrid hour -> rain probability (%)."""
     day_probs = {h: p for h, p in probs.items() if h in DAY_HOURS}
     tramos = rain_ranges(h for h, p in day_probs.items() if p >= RAIN_HOUR_MIN)
     paraguas = max(day_probs.values(), default=0) >= UMBRELLA_MIN
-    emoji, text = WMO.get(daily["weather_code"][0], UNKNOWN)
-    tmax, tmin = round(daily["temperature_2m_max"][0]), round(daily["temperature_2m_min"][0])
+    emoji, text = WMO.get(code, UNKNOWN)
+    tmax, tmin = round(tmax), round(tmin)
 
     linea = f"🌡️ {tmin}–{tmax} °C · {text}"
     if tramos:
@@ -86,7 +100,7 @@ def summarize(data, day: date):
     return {
         "max": tmax,
         "min": tmin,
-        "prob_lluvia_max": daily["precipitation_probability_max"][0],
+        "prob_lluvia_max": prob_max,
         "tramos_lluvia": tramos,
         "descripcion": f"{emoji} {text}",
         "paraguas": paraguas,
@@ -94,8 +108,78 @@ def summarize(data, day: date):
     }
 
 
+def summarize(data, day: date):
+    """Open-Meteo response -> brief weather."""
+    iso = day.isoformat()
+    daily, hourly = data["daily"], data["hourly"]
+    if daily.get("time") != [iso] or not all(t.startswith(iso) for t in hourly.get("time", [])):
+        raise ValueError(f"Open-Meteo devolvió datos de otra fecha (pedida {iso}, recibida {daily.get('time')})")
+    probs = {int(t[11:13]): p for t, p in zip(hourly["time"], hourly["precipitation_probability"]) if p is not None}
+    return build(
+        daily["temperature_2m_max"][0],
+        daily["temperature_2m_min"][0],
+        daily["precipitation_probability_max"][0],
+        probs,
+        daily["weather_code"][0],
+    )
+
+
+def metno_code(symbol):
+    """met.no symbol_code (e.g. 'lightrainshowers_day') -> WMO code; None if unknown."""
+    base = symbol.split("_")[0]
+    if "thunder" in base:
+        return 95
+    return METNO_TO_WMO.get(base)
+
+
+def summarize_metno(data, day: date):
+    """met.no locationforecast 2.0 response -> brief weather (times are UTC, converted to Madrid)."""
+    temps, probs, amounts, symbols = [], {}, {}, []
+    for entry in data["properties"]["timeseries"]:
+        when = datetime.fromisoformat(entry["time"].replace("Z", "+00:00")).astimezone(MADRID)
+        if when.date() != day:
+            continue
+        temps.append(entry["data"]["instant"]["details"]["air_temperature"])
+        nxt = entry["data"].get("next_1_hours")
+        if not nxt:  # shortcut: beyond ~2 days met.no is 6-hourly; rain hours come only from hourly steps
+            continue
+        details = nxt.get("details", {})
+        amounts[when.hour] = details.get("precipitation_amount", 0) or 0
+        if details.get("probability_of_precipitation") is not None:
+            probs[when.hour] = details["probability_of_precipitation"]
+        if when.hour in DAY_HOURS and "symbol_code" in nxt.get("summary", {}):
+            symbols.append(nxt["summary"]["symbol_code"])
+    if not temps:
+        raise ValueError(f"met.no no tiene datos para {day.isoformat()}")
+    if not probs:
+        # met.no usually gives no rain probability outside the Nordics: estimate it from the
+        # forecast amount, an hour with > 0.1 mm counts as rain (100 %), otherwise 0 %.
+        probs = {h: 100 if mm > 0.1 else 0 for h, mm in amounts.items()}
+    # shortcut: the day's description is the most common daytime symbol, not a weighted summary.
+    code = metno_code(Counter(symbols).most_common(1)[0][0]) if symbols else None
+    return build(max(temps), min(temps), max(probs.values(), default=0), probs, code)
+
+
+def get_json(url, params):
+    """GET with retries on 429/5xx (waits 2, 4, 8 s) and our own User-Agent."""
+    for wait in RETRY_WAITS + (None,):
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        if wait is not None and (resp.status_code == 429 or resp.status_code >= 500):
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+
+
 def get_weather(day: date):
-    params = dict(PARAMS, start_date=day.isoformat(), end_date=day.isoformat())
-    resp = requests.get(API_URL, params=params, timeout=20)
-    resp.raise_for_status()
-    return summarize(resp.json(), day)
+    """Returns (weather, source). Falls back to met.no if Open-Meteo fails for any reason."""
+    try:
+        params = dict(PARAMS, start_date=day.isoformat(), end_date=day.isoformat())
+        return summarize(get_json(API_URL, params), day), "open-meteo"
+    except Exception as first:
+        try:
+            return summarize_metno(get_json(METNO_URL, METNO_PARAMS), day), "met.no"
+        except Exception as second:
+            raise RuntimeError(
+                f"open-meteo: {type(first).__name__}: {first} | met.no: {type(second).__name__}: {second}"
+            ) from None
