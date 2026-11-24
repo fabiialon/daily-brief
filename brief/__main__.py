@@ -1,11 +1,14 @@
-"""CLI: python -m brief [--date YYYY-MM-DD] -> JSON on stdout, always exit 0."""
+"""CLI: python -m brief [--date YYYY-MM-DD] -> JSON on stdout, always exit 0.
+
+`--doctor` checks every source instead and exits 1 if any of them failed.
+"""
 import argparse
 import json
 import os
 import sys
 from datetime import date, datetime, timedelta
 
-from brief import blackboard, weather
+from brief import blackboard, doctor, weather
 
 
 def build(day: date):
@@ -32,11 +35,13 @@ def build(day: date):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m brief")
     parser.add_argument("--date", type=date.fromisoformat, help="YYYY-MM-DD (por defecto: hoy en Madrid)")
+    parser.add_argument("--doctor", action="store_true", help="comprueba cada fuente y clasifica los fallos")
     args = parser.parse_args(argv)
     day = args.date or datetime.now(blackboard.MADRID).date()
     sys.stdout.reconfigure(encoding="utf-8")
-    print(json.dumps(build(day), ensure_ascii=False, indent=2))
-    return 0
+    result = doctor.run(day) if args.doctor else build(day)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if args.doctor and not result["ok"] else 0
 
 
 if __name__ == "__main__":
